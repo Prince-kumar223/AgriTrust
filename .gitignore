@@ -1,6 +1,7 @@
 # ===================== Rust / Soroban (contracts) =====================
 
 target/
+test_snapshots/
 **/*.rs.bk
 *.so
 *.dylib
