@@ -506,3 +506,545 @@ impl AgriTrustContract {
         load_trade(&env, &trade_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
+        xdr::{ContractEventBody, ScVal},
+        IntoVal, TryFromVal, Val, Vec,
+    };
+
+    const TRADE_ID: &str = "trade_1";
+    const PRICE: i128 = 1_000_000; // in the token's smallest unit (e.g. stroops)
+    const CROP_DETAILS: &str = "2t wheat, Grade A";
+
+    // -----------------------------------------------------------------------
+    // Minimal mock token (SEP-41 subset) so tests exercise real cross-contract
+    // `transfer` calls without needing a deployed asset. `mint` is test-only;
+    // `transfer` panics on insufficient balance like a real token contract.
+    // -----------------------------------------------------------------------
+
+    #[contract]
+    pub struct MockToken;
+
+    #[contracttype]
+    enum MockTokenDataKey {
+        Balance(Address),
+    }
+
+    #[contractimpl]
+    impl MockToken {
+        /// Mint `amount` tokens to `to` (no admin checks — test-only).
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = MockTokenDataKey::Balance(to);
+            let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(balance + amount));
+        }
+
+        /// Returns the token balance of `id`.
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockTokenDataKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        /// Moves `amount` tokens from `from` to `to`.
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let from_key = MockTokenDataKey::Balance(from);
+            let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+            if from_balance < amount {
+                panic!("insufficient balance");
+            }
+            let to_key = MockTokenDataKey::Balance(to);
+            let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&from_key, &(from_balance - amount));
+            env.storage()
+                .persistent()
+                .set(&to_key, &(to_balance + amount));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test harness
+    // -----------------------------------------------------------------------
+
+    /// Fresh environment + deployed escrow contract + funded mock token.
+    struct TestEnv {
+        env: Env,
+        contract_id: Address,
+        /// Generated client for the escrow contract (see `client()`).
+        farmer: Address,
+        buyer: Address,
+        third_party: Address,
+        token: Address,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let env = Env::default();
+            env.mock_all_auths(); // authorize every call; auth is tested separately
+
+            let farmer = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            let third_party = Address::generate(&env);
+
+            let token = env.register(MockToken, ());
+            let token_client = MockTokenClient::new(&env, &token);
+            // Fund both parties so they can pay into / receive from the escrow.
+            token_client.mint(&farmer, &(PRICE * 10));
+            token_client.mint(&buyer, &(PRICE * 10));
+
+            let contract_id = env.register(AgriTrustContract, ());
+
+            TestEnv {
+                env,
+                contract_id,
+                farmer,
+                buyer,
+                third_party,
+                token,
+            }
+        }
+
+        /// The escrow contract client.
+        fn client(&self) -> AgriTrustContractClient<'static> {
+            AgriTrustContractClient::new(&self.env, &self.contract_id)
+        }
+
+        /// The mock token client.
+        fn token_client(&self) -> MockTokenClient<'static> {
+            MockTokenClient::new(&self.env, &self.token)
+        }
+
+        fn trade_id(&self) -> Symbol {
+            Symbol::new(&self.env, TRADE_ID)
+        }
+
+        fn create_default_trade(&self) -> Trade {
+            self.client().create_trade(
+                &self.trade_id(),
+                &self.farmer,
+                &self.buyer,
+                &self.token,
+                &String::from_str(&self.env, CROP_DETAILS),
+                &PRICE,
+            )
+        }
+
+        fn balance_of(&self, address: &Address) -> i128 {
+            self.token_client().balance(address)
+        }
+
+        fn contract_balance(&self) -> i128 {
+            self.balance_of(&self.contract_id)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for event and auth assertions
+    // -----------------------------------------------------------------------
+
+    /// First topic of the most recently published event.
+    fn last_event_topic(env: &Env) -> ScVal {
+        let events = env.events().all();
+        let last = events.events().last().expect("expected an emitted event");
+        match &last.body {
+            ContractEventBody::V0(v0) => v0.topics[0].clone(),
+        }
+    }
+
+    /// Asserts the most recent event's fixed topic is `name` (the snake_case
+    /// struct name of the `#[contractevent]`).
+    fn assert_last_event(env: &Env, name: &str) {
+        let topic: Val = Symbol::new(env, name).into_val(env);
+        let expected: ScVal = ScVal::try_from_val(env, &topic).unwrap();
+        assert_eq!(
+            last_event_topic(env),
+            expected,
+            "expected event topic '{name}'"
+        );
+    }
+
+    /// Mocks authorization for exactly one caller on one contract function, so
+    /// `require_auth()` inside the contract rejects everyone else.
+    fn mock_auth_only_for(
+        env: &Env,
+        contract_id: &Address,
+        caller: &Address,
+        fn_name: &str,
+        fn_args: &[Val],
+    ) {
+        let mut args: Vec<Val> = Vec::new(env);
+        for arg in fn_args {
+            args.push_back(*arg); // `Val` is `Copy`
+        }
+        let invoke = MockAuthInvoke {
+            contract: contract_id,
+            fn_name,
+            args,
+            sub_invokes: &[],
+        };
+        env.mock_auths(&[MockAuth {
+            address: caller,
+            invoke: &invoke,
+        }]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Happy path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_full_happy_path() {
+        let t = TestEnv::new();
+        let trade_id = t.trade_id();
+
+        // 1. Farmer creates the trade (Pending, no funds move).
+        let trade = t.create_default_trade();
+        assert_eq!(trade.state, TradeState::Pending);
+        assert_eq!(trade.farmer, t.farmer);
+        assert_eq!(trade.buyer, t.buyer);
+        assert_eq!(trade.asset, t.token);
+        assert_eq!(trade.price, PRICE);
+        assert_last_event(&t.env, "trade_created");
+
+        // 2. Buyer funds the escrow: their tokens move into the contract.
+        //    (Note: `env.events().all()` only surfaces the most recent call's
+        //    events, so the event must be asserted before any further calls.)
+        t.client().deposit_payment(&trade_id, &t.buyer);
+        assert_last_event(&t.env, "trade_funded");
+        assert_eq!(t.balance_of(&t.buyer), PRICE * 10 - PRICE);
+        assert_eq!(t.contract_balance(), PRICE);
+
+        // 3. Farmer marks the crop delivered.
+        t.client().confirm_delivery(&trade_id, &t.farmer);
+        assert_last_event(&t.env, "trade_delivered");
+
+        // 4. Buyer confirms receipt; payment is released to the farmer.
+        t.client().confirm_receipt(&trade_id, &t.buyer);
+        assert_last_event(&t.env, "trade_completed");
+        assert_eq!(t.contract_balance(), 0);
+        assert_eq!(t.balance_of(&t.farmer), PRICE * 10 + PRICE);
+
+        // 5. Final on-chain state.
+        let trade = t.client().get_trade(&trade_id);
+        assert_eq!(trade.state, TradeState::Completed);
+    }
+
+    #[test]
+    fn test_get_trade_returns_full_struct() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        let trade = t.client().get_trade(&t.trade_id());
+        assert_eq!(trade.trade_id, t.trade_id());
+        assert_eq!(trade.farmer, t.farmer);
+        assert_eq!(trade.buyer, t.buyer);
+        assert_eq!(trade.asset, t.token);
+        assert_eq!(trade.crop_details, String::from_str(&t.env, CROP_DETAILS));
+        assert_eq!(trade.price, PRICE);
+        assert_eq!(trade.state, TradeState::Pending);
+    }
+
+    // -----------------------------------------------------------------------
+    // State-machine failures (caller authorized, but transition is illegal)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_double_funding_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        // A second deposit must be rejected by the state machine.
+        let result = t.client().try_deposit_payment(&t.trade_id(), &t.buyer);
+        assert!(matches!(result, Err(Ok(Error::InvalidState))));
+        // The contract still holds exactly one deposit's worth of funds.
+        assert_eq!(t.contract_balance(), PRICE);
+    }
+
+    #[test]
+    fn test_confirm_delivery_before_funding_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        let result = t.client().try_confirm_delivery(&t.trade_id(), &t.farmer);
+        assert!(matches!(result, Err(Ok(Error::InvalidState))));
+    }
+
+    #[test]
+    fn test_confirm_receipt_before_delivery_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        // Buyer tries to confirm receipt while the crop is not yet delivered.
+        let result = t.client().try_confirm_receipt(&t.trade_id(), &t.buyer);
+        assert!(matches!(result, Err(Ok(Error::InvalidState))));
+        assert_eq!(t.contract_balance(), PRICE); // funds untouched
+    }
+
+    #[test]
+    fn test_cancel_after_funding_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        let result = t.client().try_cancel_trade(&t.trade_id(), &t.farmer);
+        assert!(matches!(result, Err(Ok(Error::InvalidState))));
+    }
+
+    #[test]
+    fn test_duplicate_trade_id_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        let result = t.client().try_create_trade(
+            &t.trade_id(),
+            &t.farmer,
+            &t.buyer,
+            &t.token,
+            &String::from_str(&t.env, CROP_DETAILS),
+            &PRICE,
+        );
+        assert!(matches!(result, Err(Ok(Error::TradeAlreadyExists))));
+    }
+
+    #[test]
+    fn test_zero_price_rejected() {
+        let t = TestEnv::new();
+
+        let result = t.client().try_create_trade(
+            &t.trade_id(),
+            &t.farmer,
+            &t.buyer,
+            &t.token,
+            &String::from_str(&t.env, CROP_DETAILS),
+            &0,
+        );
+        assert!(matches!(result, Err(Ok(Error::InvalidPrice))));
+    }
+
+    #[test]
+    fn test_get_trade_not_found() {
+        let t = TestEnv::new();
+        let result = t.client().try_get_trade(&symbol_short!("missing"));
+        assert!(matches!(result, Err(Ok(Error::TradeNotFound))));
+    }
+
+    #[test]
+    fn test_deposit_by_unregistered_buyer_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        // `third_party` is not the trade's buyer, even with auth mocked.
+        let result = t
+            .client()
+            .try_deposit_payment(&t.trade_id(), &t.third_party);
+        assert!(matches!(result, Err(Ok(Error::UnauthorizedCaller))));
+        assert_eq!(t.contract_balance(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Disputes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dispute_freezes_funds() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        let disputed = t.client().raise_dispute(
+            &t.trade_id(),
+            &t.farmer,
+            &String::from_str(&t.env, "crop quality dispute"),
+        );
+        assert_eq!(disputed.state, TradeState::Disputed);
+        assert_last_event(&t.env, "trade_disputed");
+
+        // Funds stay locked in the contract.
+        assert_eq!(t.contract_balance(), PRICE);
+
+        // No further transitions are possible while disputed.
+        let receipt = t.client().try_confirm_receipt(&t.trade_id(), &t.buyer);
+        assert!(matches!(receipt, Err(Ok(Error::InvalidState))));
+        let delivery = t.client().try_confirm_delivery(&t.trade_id(), &t.farmer);
+        assert!(matches!(delivery, Err(Ok(Error::InvalidState))));
+        let cancel = t.client().try_cancel_trade(&t.trade_id(), &t.buyer);
+        assert!(matches!(cancel, Err(Ok(Error::InvalidState))));
+    }
+
+    #[test]
+    fn test_buyer_can_also_raise_dispute() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        let result = t.client().raise_dispute(
+            &t.trade_id(),
+            &t.buyer,
+            &String::from_str(&t.env, "never received the goods"),
+        );
+        assert_eq!(result.state, TradeState::Disputed);
+    }
+
+    #[test]
+    fn test_dispute_before_funding_rejected() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        // Pending trades should be cancelled, not disputed.
+        let result = t.client().try_raise_dispute(
+            &t.trade_id(),
+            &t.buyer,
+            &String::from_str(&t.env, "premature"),
+        );
+        assert!(matches!(result, Err(Ok(Error::InvalidState))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_pending_trade() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        let cancelled = t.client().cancel_trade(&t.trade_id(), &t.buyer);
+        assert_eq!(cancelled.state, TradeState::Cancelled);
+        assert_last_event(&t.env, "trade_cancelled");
+        assert_eq!(t.contract_balance(), 0); // nothing moved, nothing to refund
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization failures (require_auth rejects the caller)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic] // `require_auth(buyer)` fails: the farmer's auth is not enough
+    fn test_deposit_by_farmer_fails_auth() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        let trade_id = t.trade_id();
+        let args: [Val; 2] = [
+            trade_id.clone().into_val(&t.env),
+            t.buyer.clone().into_val(&t.env),
+        ];
+        mock_auth_only_for(&t.env, &t.contract_id, &t.farmer, "deposit_payment", &args);
+
+        t.client().deposit_payment(&trade_id, &t.buyer);
+    }
+
+    #[test]
+    #[should_panic] // `require_auth(farmer)` fails: the buyer's auth is not enough
+    fn test_confirm_delivery_by_buyer_fails_auth() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        let trade_id = t.trade_id();
+        let args: [Val; 2] = [
+            trade_id.clone().into_val(&t.env),
+            t.farmer.clone().into_val(&t.env),
+        ];
+        mock_auth_only_for(&t.env, &t.contract_id, &t.buyer, "confirm_delivery", &args);
+
+        t.client().confirm_delivery(&trade_id, &t.farmer);
+    }
+
+    #[test]
+    #[should_panic] // `require_auth(buyer)` fails
+    fn test_confirm_receipt_by_farmer_fails_auth() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+        t.client().confirm_delivery(&t.trade_id(), &t.farmer);
+
+        let trade_id = t.trade_id();
+        let args: [Val; 2] = [
+            trade_id.clone().into_val(&t.env),
+            t.buyer.clone().into_val(&t.env),
+        ];
+        mock_auth_only_for(&t.env, &t.contract_id, &t.farmer, "confirm_receipt", &args);
+
+        t.client().confirm_receipt(&trade_id, &t.buyer);
+    }
+
+    #[test]
+    #[should_panic] // `require_auth(caller)` fails: third party is not a trade party
+    fn test_raise_dispute_by_third_party_fails_auth() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+
+        let trade_id = t.trade_id();
+        let reason = String::from_str(&t.env, "impostor");
+        let args: [Val; 3] = [
+            trade_id.clone().into_val(&t.env),
+            t.third_party.clone().into_val(&t.env),
+            reason.clone().into_val(&t.env),
+        ];
+        mock_auth_only_for(
+            &t.env,
+            &t.contract_id,
+            &t.third_party,
+            "raise_dispute",
+            &args,
+        );
+
+        t.client().raise_dispute(&trade_id, &t.third_party, &reason);
+    }
+
+    #[test]
+    #[should_panic] // `require_auth(caller)` fails: third party is not a trade party
+    fn test_cancel_by_third_party_fails_auth() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        let trade_id = t.trade_id();
+        let args: [Val; 2] = [
+            trade_id.clone().into_val(&t.env),
+            t.third_party.clone().into_val(&t.env),
+        ];
+        mock_auth_only_for(
+            &t.env,
+            &t.contract_id,
+            &t.third_party,
+            "cancel_trade",
+            &args,
+        );
+
+        t.client().cancel_trade(&trade_id, &t.third_party);
+    }
+
+    // -----------------------------------------------------------------------
+    // Token edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic] // the mock token panics on insufficient balance
+    fn test_deposit_with_insufficient_funds_panics() {
+        let t = TestEnv::new();
+        let trade_id = Symbol::new(&t.env, "unfunded_buyer");
+        // `third_party` was never minted any tokens.
+        t.client().create_trade(
+            &trade_id,
+            &t.farmer,
+            &t.third_party,
+            &t.token,
+            &String::from_str(&t.env, "very expensive crop"),
+            &(PRICE * 1000),
+        );
+
+        t.client().deposit_payment(&trade_id, &t.third_party);
+    }
+}
