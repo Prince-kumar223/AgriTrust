@@ -191,19 +191,37 @@ fn has_trade(env: &Env, trade_id: &Symbol) -> bool {
         .has(&DataKey::Trade(trade_id.clone()))
 }
 
-/// Persists `trade` under `DataKey::Trade(trade.trade_id)`.
+/// Persists `trade` under `DataKey::Trade(trade.trade_id)` and bumps the
+/// entry's time-to-live. Extending TTL on every write (and read, see
+/// [`load_trade`]) guarantees a funded/disputed trade can never expire while
+/// funds are locked in the contract — an expired record would strand the
+/// escrowed tokens with nobody able to release them.
 fn store_trade(env: &Env, trade: &Trade) {
+    let key = DataKey::Trade(trade.trade_id.clone());
+    env.storage().persistent().set(&key, trade);
     env.storage()
         .persistent()
-        .set(&DataKey::Trade(trade.trade_id.clone()), trade);
+        .extend_ttl(&key, 0, env.storage().max_ttl());
 }
 
 /// Loads the trade for `trade_id`, or returns [`Error::TradeNotFound`].
+/// Also refreshes the entry TTL so actively used trades stay alive.
 fn load_trade(env: &Env, trade_id: &Symbol) -> Result<Trade, Error> {
+    let key = DataKey::Trade(trade_id.clone());
+    let trade = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::TradeNotFound)?;
     env.storage()
         .persistent()
-        .get(&DataKey::Trade(trade_id.clone()))
-        .ok_or(Error::TradeNotFound)
+        .extend_ttl(&key, 0, env.storage().max_ttl());
+    Ok(trade)
+}
+
+/// Returns `true` if `caller` is one of the two parties of `trade`.
+fn is_party(trade: &Trade, caller: &Address) -> bool {
+    caller == &trade.farmer || caller == &trade.buyer
 }
 
 /// The AgriTrust escrow contract.
@@ -306,14 +324,19 @@ impl AgriTrustContract {
             return Err(Error::InvalidState);
         }
 
-        // Move exactly `price` from the buyer into the contract. The token
-        // contract performs the transfer; the buyer's auth covers it as a
-        // sub-invocation of this call.
-        let token = TokenClient::new(&env, &trade.asset);
-        token.transfer(&buyer, env.current_contract_address(), &trade.price);
-
+        // Persist the transition *before* the external token call
+        // (checks-effects-interactions). If the token contract — or a
+        // smart-wallet party — re-enters this contract during the transfer,
+        // the trade is already `Funded` and the re-entry is rejected.
         trade.state = TradeState::Funded;
         store_trade(&env, &trade);
+
+        // Move exactly `price` from the buyer into the contract. The token
+        // contract performs the transfer; the buyer's auth covers it as a
+        // sub-invocation of this call. If it fails, the whole call reverts
+        // (including the state change above).
+        let token = TokenClient::new(&env, &trade.asset);
+        token.transfer(&buyer, env.current_contract_address(), &trade.price);
 
         TradeFunded {
             trade_id,
@@ -387,14 +410,16 @@ impl AgriTrustContract {
             return Err(Error::InvalidState);
         }
 
+        // Persist the transition *before* the release call (checks-effects-
+        // interactions), so a re-entrant caller can never double-release.
+        trade.state = TradeState::Completed;
+        store_trade(&env, &trade);
+
         // Release: pay the farmer the escrowed price out of the contract.
         // The contract itself is the `from` address, so no extra auth entry
         // is needed — the contract authorizes its own outgoing transfer.
         let token = TokenClient::new(&env, &trade.asset);
         token.transfer(&env.current_contract_address(), &trade.farmer, &trade.price);
-
-        trade.state = TradeState::Completed;
-        store_trade(&env, &trade);
 
         TradeCompleted {
             trade_id,
@@ -431,7 +456,7 @@ impl AgriTrustContract {
         let mut trade = load_trade(&env, &trade_id)?;
 
         // Only one of the two parties may raise a dispute.
-        if caller != trade.farmer && caller != trade.buyer {
+        if !is_party(&trade, &caller) {
             return Err(Error::UnauthorizedCaller);
         }
         caller.require_auth();
@@ -475,7 +500,7 @@ impl AgriTrustContract {
         let mut trade = load_trade(&env, &trade_id)?;
 
         // Either party may cancel a not-yet-funded trade.
-        if caller != trade.farmer && caller != trade.buyer {
+        if !is_party(&trade, &caller) {
             return Err(Error::UnauthorizedCaller);
         }
         caller.require_auth();
@@ -765,7 +790,9 @@ mod tests {
         // A second deposit must be rejected by the state machine.
         let result = t.client().try_deposit_payment(&t.trade_id(), &t.buyer);
         assert!(matches!(result, Err(Ok(Error::InvalidState))));
-        // The contract still holds exactly one deposit's worth of funds.
+        // The buyer is not charged twice and the contract holds exactly one
+        // deposit's worth of funds.
+        assert_eq!(t.balance_of(&t.buyer), PRICE * 10 - PRICE);
         assert_eq!(t.contract_balance(), PRICE);
     }
 
@@ -896,6 +923,28 @@ mod tests {
     }
 
     #[test]
+    fn test_dispute_after_delivery_freezes_funds() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+        t.client().deposit_payment(&t.trade_id(), &t.buyer);
+        t.client().confirm_delivery(&t.trade_id(), &t.farmer);
+
+        // The buyer disputes after delivery, e.g. the goods never arrived.
+        let disputed = t.client().raise_dispute(
+            &t.trade_id(),
+            &t.buyer,
+            &String::from_str(&t.env, "goods not received"),
+        );
+        assert_eq!(disputed.state, TradeState::Disputed);
+        assert_last_event(&t.env, "trade_disputed");
+
+        // Funds stay locked; receipt can no longer release them.
+        assert_eq!(t.contract_balance(), PRICE);
+        let receipt = t.client().try_confirm_receipt(&t.trade_id(), &t.buyer);
+        assert!(matches!(receipt, Err(Ok(Error::InvalidState))));
+    }
+
+    #[test]
     fn test_dispute_before_funding_rejected() {
         let t = TestEnv::new();
         t.create_default_trade();
@@ -922,6 +971,16 @@ mod tests {
         assert_eq!(cancelled.state, TradeState::Cancelled);
         assert_last_event(&t.env, "trade_cancelled");
         assert_eq!(t.contract_balance(), 0); // nothing moved, nothing to refund
+    }
+
+    #[test]
+    fn test_cancel_by_farmer() {
+        let t = TestEnv::new();
+        t.create_default_trade();
+
+        // The farmer (the party who created the trade) may cancel too.
+        let cancelled = t.client().cancel_trade(&t.trade_id(), &t.farmer);
+        assert_eq!(cancelled.state, TradeState::Cancelled);
     }
 
     // -----------------------------------------------------------------------
