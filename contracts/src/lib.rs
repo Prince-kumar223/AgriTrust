@@ -185,7 +185,6 @@ pub struct TradeCancelled {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if a trade with `trade_id` exists in persistent storage.
-#[allow(dead_code)] // used by `create_trade` (added in the next stage)
 fn has_trade(env: &Env, trade_id: &Symbol) -> bool {
     env.storage()
         .persistent()
@@ -193,7 +192,6 @@ fn has_trade(env: &Env, trade_id: &Symbol) -> bool {
 }
 
 /// Persists `trade` under `DataKey::Trade(trade.trade_id)`.
-#[allow(dead_code)] // used by `create_trade` (added in the next stage)
 fn store_trade(env: &Env, trade: &Trade) {
     env.storage()
         .persistent()
@@ -214,6 +212,69 @@ pub struct AgriTrustContract;
 
 #[contractimpl]
 impl AgriTrustContract {
+    /// Creates a new trade in the [`TradeState::Pending`] state.
+    ///
+    /// Only the farmer (the party selling the produce) may create a trade —
+    /// their [`Address::require_auth`] is enforced. No funds move here.
+    ///
+    /// # Arguments
+    /// * `trade_id` — unique on-chain id, also used as the storage key.
+    ///   Reusing an existing id is rejected with [`Error::TradeAlreadyExists`].
+    /// * `farmer` — seller address. Must be the caller.
+    /// * `buyer` — buyer address that will fund the escrow later.
+    /// * `asset` — token contract whose units are escrowed (XLM or any
+    ///   Stellar asset). Stored per-trade so trades can use different assets.
+    /// * `crop_details` — human-readable description of the produce.
+    /// * `price` — agreed price in the smallest unit of `asset` (must be > 0).
+    ///
+    /// # Errors
+    /// * [`Error::TradeAlreadyExists`] — `trade_id` is already in use.
+    /// * [`Error::InvalidPrice`] — `price` is not strictly positive.
+    pub fn create_trade(
+        env: Env,
+        trade_id: Symbol,
+        farmer: Address,
+        buyer: Address,
+        asset: Address,
+        crop_details: String,
+        price: i128,
+    ) -> Result<Trade, Error> {
+        // Only the farmer may create a trade on their own behalf.
+        farmer.require_auth();
+
+        // `trade_id` is the persistent-storage key: a collision would silently
+        // overwrite an existing trade, so reject it explicitly.
+        if has_trade(&env, &trade_id) {
+            return Err(Error::TradeAlreadyExists);
+        }
+        if price <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+
+        let trade = Trade {
+            trade_id: trade_id.clone(),
+            farmer: farmer.clone(),
+            buyer: buyer.clone(),
+            asset,
+            crop_details,
+            price,
+            state: TradeState::Pending,
+        };
+        store_trade(&env, &trade);
+
+        // Emit the creation event so off-chain indexers can track the trade.
+        TradeCreated {
+            trade_id,
+            farmer,
+            buyer,
+            crop_details: trade.crop_details.clone(),
+            price: trade.price,
+        }
+        .publish(&env);
+
+        Ok(trade)
+    }
+
     /// View function: returns the full `Trade` struct for `trade_id`.
     ///
     /// No authorization is required — reading on-chain state is public.
