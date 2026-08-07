@@ -1,0 +1,63 @@
+# Pre-commit hooks for the AgriTrust monorepo.
+# Install with:  pip install pre-commit && pre-commit install
+#
+# - Python (backend):  black + ruff (format + lint)
+# - JavaScript (frontend): eslint + prettier
+# - Rust (contracts): cargo fmt + clippy (requires cargo on PATH)
+# - Generic: whitespace / YAML / JSON sanity checks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  # ---- Python: black + ruff (config lives in backend/pyproject.toml) ----
+  - repo: https://github.com/psf/black
+    rev: 26.5.1
+    hooks:
+      - id: black
+        args: [--config, backend/pyproject.toml]
+        files: ^backend/
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff
+        args: [--fix, --config, backend/pyproject.toml]
+        files: ^backend/
+      - id: ruff-format
+        args: [--config, backend/pyproject.toml]
+        files: ^backend/
+
+  # ---- JavaScript/TypeScript: eslint + prettier ----
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.14.0
+    hooks:
+      - id: eslint
+        args: [--config, frontend/eslint.config.js, --fix]
+        files: ^frontend/.*\.(js|jsx|ts|tsx)$
+
+  - repo: https://github.com/mirrors-prettier/mirrors-prettier
+    rev: v3.9.6
+    hooks:
+      - id: prettier
+        files: ^frontend/.*\.(js|jsx|ts|tsx|css|json|md|html|yml|yaml)$
+
+  # ---- Rust: cargo fmt + clippy (scoped to the contracts workspace) ----
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (contracts)
+        entry: cargo fmt --manifest-path contracts/Cargo.toml
+        language: system
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy (contracts)
+        entry: cargo clippy --manifest-path contracts/Cargo.toml --all-targets -- -D warnings
+        language: system
+        pass_filenames: false

@@ -1,0 +1,6 @@
+-r requirements.txt
+
+black==26.5.1
+ruff==0.16.2
+pytest>=8.3,<9.0
+pytest-django>=4.9,<5.0

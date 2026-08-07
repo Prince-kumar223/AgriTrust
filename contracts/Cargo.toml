@@ -1,0 +1,24 @@
+[package]
+name = "agritrust-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "AgriTrust agricultural escrow smart contract (Soroban)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = "27.0.5"
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.5", features = ["testutils"] }
+
+[profile.release]
+opt-level = 3
+overflow-checks = true
+debug = false
+strip = "symbols"
+lto = true
+codegen-units = 1
+panic = "abort"
