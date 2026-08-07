@@ -40,8 +40,8 @@
 //! [CAP-44]: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0044.md
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String,
-    Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, token::TokenClient,
+    Address, Env, String, Symbol,
 };
 
 /// Errors returned by this contract. Serialized on-chain so callers receive
@@ -271,6 +271,224 @@ impl AgriTrustContract {
             price: trade.price,
         }
         .publish(&env);
+
+        Ok(trade)
+    }
+
+    /// Locks the buyer's payment in the escrow contract ([`TradeState::Funded`]).
+    ///
+    /// The caller must be the buyer registered at trade creation — their
+    /// [`Address::require_auth`] is enforced. The escrowed amount is *derived
+    /// from the trade itself* (exactly `price`), so the escrow can never be
+    /// funded with more or less than the agreed price.
+    ///
+    /// # Arguments
+    /// * `trade_id` — identifier of the trade to fund.
+    /// * `buyer` — address funding the escrow; must equal `Trade::buyer`.
+    ///
+    /// # Errors
+    /// * [`Error::TradeNotFound`] — no trade with this id exists.
+    /// * [`Error::UnauthorizedCaller`] — `buyer` is not the registered buyer.
+    /// * [`Error::InvalidState`] — the trade is not [`TradeState::Pending`]
+    ///   (e.g. it is already funded — double funding is rejected).
+    pub fn deposit_payment(env: Env, trade_id: Symbol, buyer: Address) -> Result<Trade, Error> {
+        let mut trade = load_trade(&env, &trade_id)?;
+
+        // Only the buyer registered at creation may fund the escrow.
+        if buyer != trade.buyer {
+            return Err(Error::UnauthorizedCaller);
+        }
+        // Prove that the buyer's key authorized this exact call.
+        buyer.require_auth();
+
+        // A trade is funded exactly once, from the Pending state.
+        if trade.state != TradeState::Pending {
+            return Err(Error::InvalidState);
+        }
+
+        // Move exactly `price` from the buyer into the contract. The token
+        // contract performs the transfer; the buyer's auth covers it as a
+        // sub-invocation of this call.
+        let token = TokenClient::new(&env, &trade.asset);
+        token.transfer(&buyer, env.current_contract_address(), &trade.price);
+
+        trade.state = TradeState::Funded;
+        store_trade(&env, &trade);
+
+        TradeFunded {
+            trade_id,
+            buyer,
+            amount: trade.price,
+        }
+        .publish(&env);
+
+        Ok(trade)
+    }
+
+    /// Farmer marks the crop as delivered ([`TradeState::Delivered`]).
+    ///
+    /// # Arguments
+    /// * `trade_id` — identifier of the trade.
+    /// * `farmer` — address confirming delivery; must equal `Trade::farmer`.
+    ///
+    /// # Errors
+    /// * [`Error::TradeNotFound`] — no trade with this id exists.
+    /// * [`Error::UnauthorizedCaller`] — `farmer` is not the registered farmer.
+    /// * [`Error::InvalidState`] — the trade is not [`TradeState::Funded`]
+    ///   (delivery cannot be confirmed before the escrow is funded).
+    pub fn confirm_delivery(env: Env, trade_id: Symbol, farmer: Address) -> Result<Trade, Error> {
+        let mut trade = load_trade(&env, &trade_id)?;
+
+        // Only the registered farmer may mark the crop as delivered.
+        if farmer != trade.farmer {
+            return Err(Error::UnauthorizedCaller);
+        }
+        farmer.require_auth();
+
+        // Delivery only makes sense after the escrow is funded.
+        if trade.state != TradeState::Funded {
+            return Err(Error::InvalidState);
+        }
+
+        trade.state = TradeState::Delivered;
+        store_trade(&env, &trade);
+
+        TradeDelivered { trade_id, farmer }.publish(&env);
+
+        Ok(trade)
+    }
+
+    /// Buyer confirms receipt; the payment is automatically released to the
+    /// farmer ([`TradeState::Completed`]).
+    ///
+    /// This is the only function that moves funds *out* of the escrow: it
+    /// transfers `price` from the contract to the farmer.
+    ///
+    /// # Arguments
+    /// * `trade_id` — identifier of the trade.
+    /// * `buyer` — address confirming receipt; must equal `Trade::buyer`.
+    ///
+    /// # Errors
+    /// * [`Error::TradeNotFound`] — no trade with this id exists.
+    /// * [`Error::UnauthorizedCaller`] — `buyer` is not the registered buyer.
+    /// * [`Error::InvalidState`] — the trade is not [`TradeState::Delivered`]
+    ///   (receipt cannot be confirmed before delivery).
+    pub fn confirm_receipt(env: Env, trade_id: Symbol, buyer: Address) -> Result<Trade, Error> {
+        let mut trade = load_trade(&env, &trade_id)?;
+
+        // Only the registered buyer may confirm receipt of the goods.
+        if buyer != trade.buyer {
+            return Err(Error::UnauthorizedCaller);
+        }
+        buyer.require_auth();
+
+        // Receipt can only be confirmed after the farmer marked delivery.
+        if trade.state != TradeState::Delivered {
+            return Err(Error::InvalidState);
+        }
+
+        // Release: pay the farmer the escrowed price out of the contract.
+        // The contract itself is the `from` address, so no extra auth entry
+        // is needed — the contract authorizes its own outgoing transfer.
+        let token = TokenClient::new(&env, &trade.asset);
+        token.transfer(&env.current_contract_address(), &trade.farmer, &trade.price);
+
+        trade.state = TradeState::Completed;
+        store_trade(&env, &trade);
+
+        TradeCompleted {
+            trade_id,
+            farmer: trade.farmer.clone(),
+            buyer,
+            amount: trade.price,
+        }
+        .publish(&env);
+
+        Ok(trade)
+    }
+
+    /// Either party freezes the escrow by raising a dispute
+    /// ([`TradeState::Disputed`]). Funds stay locked in the contract until
+    /// the dispute is resolved (resolution / arbitration is out of scope for
+    /// v1 — handled off-chain).
+    ///
+    /// # Arguments
+    /// * `trade_id` — identifier of the trade.
+    /// * `caller` — address raising the dispute; must be a trade party.
+    /// * `reason` — free-text description of the dispute.
+    ///
+    /// # Errors
+    /// * [`Error::TradeNotFound`] — no trade with this id exists.
+    /// * [`Error::UnauthorizedCaller`] — `caller` is neither party.
+    /// * [`Error::InvalidState`] — the trade is not funded or delivered; a
+    ///   `Pending` trade (no money moved) should be cancelled instead.
+    pub fn raise_dispute(
+        env: Env,
+        trade_id: Symbol,
+        caller: Address,
+        reason: String,
+    ) -> Result<Trade, Error> {
+        let mut trade = load_trade(&env, &trade_id)?;
+
+        // Only one of the two parties may raise a dispute.
+        if caller != trade.farmer && caller != trade.buyer {
+            return Err(Error::UnauthorizedCaller);
+        }
+        caller.require_auth();
+
+        // Disputes only make sense once funds are locked in escrow.
+        if trade.state != TradeState::Funded && trade.state != TradeState::Delivered {
+            return Err(Error::InvalidState);
+        }
+
+        trade.state = TradeState::Disputed;
+        store_trade(&env, &trade);
+
+        TradeDisputed {
+            trade_id,
+            caller,
+            reason,
+        }
+        .publish(&env);
+
+        Ok(trade)
+    }
+
+    /// Cancels a [`TradeState::Pending`] trade ([`TradeState::Cancelled`]).
+    ///
+    /// Allowed only *before* funding — since no funds have moved yet, nothing
+    /// needs to be refunded. The cancelled record is kept on-chain for
+    /// auditability.
+    ///
+    /// # Arguments
+    /// * `trade_id` — identifier of the trade.
+    /// * `caller` — address requesting the cancellation; must be a trade
+    ///   party. (The caller is passed explicitly because either party may
+    ///   cancel; [`Address::require_auth`] still proves their key signed it.)
+    ///
+    /// # Errors
+    /// * [`Error::TradeNotFound`] — no trade with this id exists.
+    /// * [`Error::UnauthorizedCaller`] — `caller` is neither party.
+    /// * [`Error::InvalidState`] — the trade is not [`TradeState::Pending`]
+    ///   (once funded, the escrow must complete or be disputed).
+    pub fn cancel_trade(env: Env, trade_id: Symbol, caller: Address) -> Result<Trade, Error> {
+        let mut trade = load_trade(&env, &trade_id)?;
+
+        // Either party may cancel a not-yet-funded trade.
+        if caller != trade.farmer && caller != trade.buyer {
+            return Err(Error::UnauthorizedCaller);
+        }
+        caller.require_auth();
+
+        // Only before funding.
+        if trade.state != TradeState::Pending {
+            return Err(Error::InvalidState);
+        }
+
+        trade.state = TradeState::Cancelled;
+        store_trade(&env, &trade);
+
+        TradeCancelled { trade_id, caller }.publish(&env);
 
         Ok(trade)
     }
