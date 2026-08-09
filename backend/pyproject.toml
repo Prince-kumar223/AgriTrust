@@ -7,10 +7,14 @@ extend-exclude = "migrations"
 line-length = 100
 target-version = "py313"
 extend-exclude = ["migrations"]
+src = ["backend"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "DJ"]
 ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agritrust"]
 
 [tool.ruff.lint.per-file-ignores]
 "config/settings_test.py" = ["F403", "F401"]

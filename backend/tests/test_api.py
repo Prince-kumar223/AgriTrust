@@ -1,7 +1,8 @@
 import pytest
-from agritrust.models import CropListing, Offer, Trade, User
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
+
+from agritrust.models import CropListing, Offer, Trade, User
 
 
 @pytest.fixture

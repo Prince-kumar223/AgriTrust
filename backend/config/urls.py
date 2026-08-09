@@ -1,5 +1,10 @@
 """Root URL configuration for the AgriTrust backend."""
 
+from django.contrib import admin
+from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+from rest_framework.routers import DefaultRouter
+
 from agritrust.views import (
     CropListingViewSet,
     FeedbackViewSet,
@@ -9,10 +14,6 @@ from agritrust.views import (
     WalletLoginView,
     analytics_summary,
 )
-from django.contrib import admin
-from django.urls import include, path
-from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
-from rest_framework.routers import DefaultRouter
 
 router = DefaultRouter()
 router.register("listings", CropListingViewSet, basename="listing")
