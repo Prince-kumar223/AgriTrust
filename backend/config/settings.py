@@ -45,8 +45,11 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     # Third-party
     "rest_framework",
+    "rest_framework.authtoken",
+    "drf_spectacular",
     "corsheaders",
-    # AgriTrust feature apps will be registered here in a later phase.
+    # Local apps
+    "agritrust",
 ]
 
 MIDDLEWARE = [
@@ -133,11 +136,32 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # ---------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.UserRateThrottle",
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.ScopedRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "user": "1000/day",
+        "anon": "100/day",
+        "writes": os.environ.get("DRF_WRITE_THROTTLE_RATE", "60/min"),
+        "wallet_auth": os.environ.get("DRF_WALLET_AUTH_THROTTLE_RATE", "10/min"),
+    },
+}
+
+AUTH_USER_MODEL = "agritrust.User"
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "AgriTrust API",
+    "DESCRIPTION": "Wallet-authenticated REST API for agricultural escrow workflows.",
+    "VERSION": "0.1.0",
 }
 
 # ---------------------------------------------------------------------------
