@@ -70,13 +70,14 @@ def test_buyer_offer_flow_and_farmer_acceptance(api_client, farmer, buyer):
 
     offer_response = api_client.post(
         "/api/offers/",
-        {"listing": listing.id, "offered_price": "1450.00", "message": "Ready to buy"},
+        {"listing_id": listing.id, "offered_price": "1450.00", "message": "Ready to buy"},
         format="json",
     )
 
     assert offer_response.status_code == 201
     offer = Offer.objects.get()
     assert offer.buyer == buyer
+    assert offer_response.data["listing"]["id"] == listing.id
     listing.refresh_from_db()
     assert listing.status == CropListing.Status.OFFERED
 
@@ -146,3 +147,38 @@ def test_trade_state_sync(api_client, farmer, buyer):
     assert trade.deposit_tx_hash == "tx-deposit"
     assert trade.delivery_tx_hash == "tx-delivery"
     assert trade.confirmation_tx_hash == "tx-confirm"
+
+
+@pytest.mark.django_db
+def test_trade_sync_state_records_confirmed_chain_update(api_client, farmer, buyer):
+    listing = CropListing.objects.create(
+        farmer=farmer,
+        crop_type="Tomato",
+        quantity="12.00",
+        unit="crate",
+        price_per_unit="25.00",
+    )
+    offer = Offer.objects.create(
+        listing=listing,
+        buyer=buyer,
+        offered_price="300.00",
+        status=Offer.Status.ACCEPTED,
+    )
+    trade = Trade.objects.create(
+        offer=offer,
+        on_chain_trade_id="trade-sync",
+        contract_address="CCONTRACT",
+        create_tx_hash="tx-create",
+    )
+    authenticate(api_client, buyer)
+
+    response = api_client.post(
+        f"/api/trades/{trade.id}/sync_state/",
+        {"status": Trade.Status.FUNDED, "tx_hash": "tx-funded"},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    trade.refresh_from_db()
+    assert trade.status == Trade.Status.FUNDED
+    assert trade.deposit_tx_hash == "tx-funded"
