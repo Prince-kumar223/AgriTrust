@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 import { Skeleton } from '../components/Skeleton';
+import { TradeSyncButton } from '../components/TradeSyncButton';
 import { useCreateOffer, useListings, useTrades } from '../hooks/useAgriTrustData';
 
 export function BuyerDashboardPage() {
@@ -27,6 +28,9 @@ export function BuyerDashboardPage() {
     <main className="mx-auto grid max-w-7xl gap-6 px-4 py-8 lg:grid-cols-[1.15fr_0.85fr]">
       <section>
         <h1 className="text-3xl font-bold text-[#1B4332]">Buyer dashboard</h1>
+        <div className="mt-4">
+          <TradeSyncButton />
+        </div>
         <Card className="mt-6">
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="flex items-center gap-2 rounded-md border border-[#DAD2BE] bg-white px-3 py-2">
@@ -75,7 +79,7 @@ export function BuyerDashboardPage() {
                     event.preventDefault();
                     const form = new FormData(event.currentTarget);
                     createOffer.mutate({
-                      listing: listing.id,
+                      listing_id: listing.id,
                       offered_price: String(form.get('offered_price') ?? ''),
                       message: String(form.get('message') ?? ''),
                     });

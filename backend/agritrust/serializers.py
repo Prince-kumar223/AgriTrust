@@ -96,10 +96,23 @@ class CropListingSerializer(serializers.ModelSerializer):
 
 class OfferSerializer(serializers.ModelSerializer):
     buyer = UserSerializer(read_only=True)
+    listing = CropListingSerializer(read_only=True)
+    listing_id = serializers.PrimaryKeyRelatedField(
+        queryset=CropListing.objects.all(), source="listing", write_only=True
+    )
 
     class Meta:
         model = Offer
-        fields = ["id", "listing", "buyer", "offered_price", "message", "status", "created_at"]
+        fields = [
+            "id",
+            "listing",
+            "listing_id",
+            "buyer",
+            "offered_price",
+            "message",
+            "status",
+            "created_at",
+        ]
         read_only_fields = ["id", "buyer", "status", "created_at"]
 
     def validate_offered_price(self, value):
@@ -149,6 +162,11 @@ class TradeSerializer(serializers.ModelSerializer):
 
 class TxHashSerializer(serializers.Serializer):
     tx_hash = serializers.CharField(max_length=128)
+
+
+class TradeSyncSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=Trade.Status.choices)
+    tx_hash = serializers.CharField(max_length=128, required=False, allow_blank=True)
 
 
 class AnalyticsSummarySerializer(serializers.Serializer):

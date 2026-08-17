@@ -23,7 +23,8 @@ export type CropListing = {
 
 export type Offer = {
   id: number;
-  listing: number;
+  listing: CropListing;
+  listing_id?: number;
   buyer: User;
   offered_price: string;
   message: string;

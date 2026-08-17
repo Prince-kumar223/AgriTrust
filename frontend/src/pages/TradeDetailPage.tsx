@@ -8,19 +8,22 @@ import { Card } from '../components/Card';
 import { FeedbackModal } from '../components/FeedbackModal';
 import { Skeleton } from '../components/Skeleton';
 import { StateSteps } from '../components/StateSteps';
+import { TradeSyncButton } from '../components/TradeSyncButton';
 import { useRecordTradeTransition, useTrade } from '../hooks/useAgriTrustData';
-import { signEscrowTransaction } from '../lib/freighter';
+import { useWallet } from '../hooks/useWallet';
+import { advanceTradeOnChain } from '../lib/soroban';
 
 const transitionByStatus = {
   pending: { action: 'record_deposit', label: 'Deposit Payment', icon: Coins },
   funded: { action: 'record_delivery', label: 'Confirm Delivery', icon: PackageCheck },
   delivered: { action: 'record_confirmation', label: 'Confirm Receipt', icon: CheckCircle2 },
-};
+} as const;
 
 export function TradeDetailPage() {
   const { tradeId } = useParams();
   const trade = useTrade(tradeId);
   const transition = useRecordTradeTransition(tradeId);
+  const wallet = useWallet();
   const [showFeedback, setShowFeedback] = useState(false);
 
   async function performAction() {
@@ -28,20 +31,25 @@ export function TradeDetailPage() {
     const next = transitionByStatus[trade.data.status as keyof typeof transitionByStatus];
     if (!next) return;
     try {
-      await signEscrowTransaction(
-        'PLACEHOLDER_CONTRACT_CALL_XDR',
-        'Test SDF Network ; September 2015',
+      const walletState = await wallet.state.refetch();
+      const address =
+        walletState.data?.status === 'connected' ? walletState.data.address : undefined;
+      if (!address) throw new Error('Connect Freighter before updating this trade.');
+      const chainResult = await advanceTradeOnChain(
+        trade.data.status,
+        trade.data.on_chain_trade_id,
+        address,
       );
       transition.mutate(
-        { action: next.action, tx_hash: `tx-${Date.now()}` },
+        { action: next.action, tx_hash: chainResult.txHash, status: chainResult.nextStatus },
         {
           onSuccess: (updatedTrade) => {
             if (updatedTrade.status === 'completed') setShowFeedback(true);
           },
         },
       );
-    } catch {
-      toast.error('Transaction was not signed. Please check Freighter and retry.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Chain transaction failed.');
     }
   }
 
@@ -99,6 +107,7 @@ export function TradeDetailPage() {
               Leave Feedback
             </Button>
           ) : null}
+          <TradeSyncButton />
         </div>
       </Card>
       {showFeedback ? (

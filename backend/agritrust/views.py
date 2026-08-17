@@ -14,6 +14,7 @@ from .serializers import (
     FeedbackSerializer,
     OfferSerializer,
     TradeSerializer,
+    TradeSyncSerializer,
     TxHashSerializer,
     UserSerializer,
     WalletChallengeSerializer,
@@ -146,6 +147,28 @@ class TradeViewSet(WriteThrottleMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def record_dispute(self, request, pk=None):
         return self._record_transition(request, Trade.Status.DISPUTED, "dispute_tx_hash")
+
+    @action(detail=True, methods=["post"])
+    def sync_state(self, request, pk=None):
+        trade = self.get_object()
+        serializer = TradeSyncSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        status = serializer.validated_data["status"]
+        tx_hash = serializer.validated_data.get("tx_hash", "")
+        tx_field_by_status = {
+            Trade.Status.FUNDED: "deposit_tx_hash",
+            Trade.Status.DELIVERED: "delivery_tx_hash",
+            Trade.Status.COMPLETED: "confirmation_tx_hash",
+            Trade.Status.DISPUTED: "dispute_tx_hash",
+        }
+        update_fields = ["status", "updated_at"]
+        if tx_hash and status in tx_field_by_status:
+            tx_field = tx_field_by_status[status]
+            setattr(trade, tx_field, tx_hash)
+            update_fields.append(tx_field)
+        trade.status = status
+        trade.save(update_fields=update_fields)
+        return Response(self.get_serializer(trade).data)
 
     def _record_transition(self, request, next_status, tx_field):
         trade = self.get_object()

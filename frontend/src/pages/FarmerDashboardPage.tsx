@@ -4,6 +4,7 @@ import type { FormEvent } from 'react';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 import { Skeleton } from '../components/Skeleton';
+import { TradeSyncButton } from '../components/TradeSyncButton';
 import {
   useAcceptOffer,
   useCreateListing,
@@ -29,6 +30,9 @@ export function FarmerDashboardPage() {
     <main className="mx-auto grid max-w-7xl gap-6 px-4 py-8 lg:grid-cols-[0.9fr_1.1fr]">
       <section>
         <h1 className="text-3xl font-bold text-[#1B4332]">Farmer dashboard</h1>
+        <div className="mt-4">
+          <TradeSyncButton />
+        </div>
         <Card className="mt-6">
           <h2 className="font-semibold text-[#1B4332]">Create listing</h2>
           <form className="mt-4 grid gap-3" onSubmit={submitListing}>
