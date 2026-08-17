@@ -186,3 +186,10 @@ CSRF_TRUSTED_ORIGINS = [
     for origin in os.environ.get("CSRF_TRUSTED_ORIGINS", "http://localhost:5173").split(",")
     if origin.strip()
 ]
+
+# ---------------------------------------------------------------------------
+# Stellar / Soroban reconciliation
+# ---------------------------------------------------------------------------
+STELLAR_CLI_BIN = os.environ.get("STELLAR_CLI_BIN", "stellar")
+STELLAR_NETWORK = os.environ.get("STELLAR_NETWORK", "testnet")
+STELLAR_CLI_TIMEOUT_SECONDS = int(os.environ.get("STELLAR_CLI_TIMEOUT_SECONDS", "30"))
